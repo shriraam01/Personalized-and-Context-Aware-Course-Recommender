@@ -13,6 +13,7 @@ USE course_recommender;
 -- DROP OLD TABLES
 -- ============================================================
 
+DROP TABLE IF EXISTS feedback;
 DROP TABLE IF EXISTS courses;
 DROP TABLE IF EXISTS users;
 
@@ -27,7 +28,7 @@ CREATE TABLE users (
     password VARCHAR(64) NOT NULL,
 
     -- PERSONALIZATION
-    interests TEXT,
+    interests VARCHAR(150),
     career_goal VARCHAR(150),
 
     education_level VARCHAR(100),
@@ -35,11 +36,11 @@ CREATE TABLE users (
     current_year VARCHAR(50),
     academic_performance DECIMAL(5,2),
 
-    existing_skills TEXT,
+    existing_skills VARCHAR(150),
     experience_level VARCHAR(50),
     experience_years DECIMAL(4,1),
 
-    desired_skills TEXT,
+    desired_skills VARCHAR(150),
     target_job_role VARCHAR(150),
     target_industry VARCHAR(150),
 
@@ -102,8 +103,28 @@ CREATE TABLE courses (
 ) ENGINE=InnoDB;
 
 -- ============================================================
+-- FEEDBACK (thumbs up/down, drives collaborative filtering + XGBoost)
+-- ============================================================
+
+CREATE TABLE feedback (
+    id         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    username   VARCHAR(80)  NOT NULL,
+    course_id  INT UNSIGNED NOT NULL,
+    liked      TINYINT(1)   NOT NULL DEFAULT 1,
+    created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_user_course (username, course_id),
+    INDEX idx_username (username),
+    INDEX idx_course   (course_id)
+) ENGINE=InnoDB;
+
+-- ============================================================
 -- LOAD COURSES CSV
 -- ============================================================
+-- NOTE: courses.csv stores is_free_to_audit / certification_offered as the
+-- literal text "True"/"False". MySQL's LOAD DATA casts a non-numeric string
+-- straight into a BOOLEAN (TINYINT) column as 0 -- silently turning every
+-- row into "False" for both fields. The two columns are loaded into
+-- throwaway user variables below and case-converted before insertion.
 
 LOAD DATA LOCAL INFILE 'courses.csv'
 INTO TABLE courses
@@ -120,12 +141,15 @@ IGNORE 1 ROWS
     course_description,
     skills,
     course_format,
-    is_free_to_audit,
+    @is_free_raw,
     budget_tier,
-    certification_offered,
+    @cert_raw,
     estimated_duration_hours,
     time_commitment_tier,
     learning_mode,
     primary_domain,
     secondary_domain
-);
+)
+SET
+    is_free_to_audit       = IF(@is_free_raw = 'True', 1, 0),
+    certification_offered  = IF(@cert_raw    = 'True', 1, 0);
