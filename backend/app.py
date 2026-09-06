@@ -1,3 +1,14 @@
+"""
+Course Recommender - Flask Backend
+====================================
+Rebuilt for the Coursera dataset / new personalization+context schema.
+All 4 ML improvements preserved:
+  1. Feedback system  — thumbs up/down stored, XGBoost trained on real signals
+  2. Collaborative filtering — similar users boost shared liked courses
+  3. Sentence Transformers — semantic similarity (falls back to TF-IDF)
+  4. Profile-to-field mapping — budget/time/certification matched directly to course fields
+"""
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
@@ -10,7 +21,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
 from xgboost import XGBRegressor
 
-# ── Sentence Transformers ─────────────────────────────────────────────────────
+# ── Improvement 3: Sentence Transformers ─────────────────────────────────────
 try:
     from sentence_transformers import SentenceTransformer
     _ST = SentenceTransformer("all-MiniLM-L6-v2")
@@ -38,6 +49,24 @@ def get_course_embeddings(corpus):
     print("[CACHE] Done — embeddings cached in memory.")
     return embeddings
 
+def build_corpus(df):
+    """
+    Build the semantic-embedding corpus from the new Coursera fields.
+    Used both at startup (precompute) and per-request (recommend) — the
+    two MUST produce identical text for a given row so the embedding
+    cache actually hits.
+    """
+    names = df["course_name"].astype(str).tolist()
+    descs = df["course_description"].astype(str).tolist()
+    skills = df["skills"].astype(str).tolist()
+    pdom  = df["primary_domain"].astype(str).tolist()
+    sdom  = df["secondary_domain"].astype(str).tolist()
+    diffs = df["difficulty_level"].astype(str).tolist()
+    corpus = []
+    for n, d, sk, pd_, sd, dl in zip(names, descs, skills, pdom, sdom, diffs):
+        corpus.append(f"{n} {n} {d[:400]} {sk} {pd_} {sd} {dl}")
+    return corpus
+
 def precompute_embeddings():
     """Called once at startup — fetches all courses and pre-encodes them."""
     if not USE_SEMANTIC:
@@ -46,13 +75,16 @@ def precompute_embeddings():
         print("[STARTUP] Pre-computing course embeddings...")
         conn = get_db()
         cur  = conn.cursor(dictionary=True)
-        cur.execute("SELECT course_name, course_description, skills FROM courses")
+        cur.execute("""SELECT course_name, course_description, skills,
+                              primary_domain, secondary_domain, difficulty_level
+                       FROM courses""")
         rows = cur.fetchall()
         cur.close(); conn.close()
         if not rows:
             print("[STARTUP] No courses found — skipping precompute.")
             return
-        corpus = [build_course_text(r) for r in rows]
+        df = pd.DataFrame(rows).fillna("")
+        corpus = build_corpus(df)
         get_course_embeddings(corpus)
         print(f"[STARTUP] {len(corpus)} course embeddings ready. First request will be fast.")
     except Exception as e:
@@ -76,160 +108,111 @@ def hash_pw(pw):
 def safe(v):
     return "" if v is None else str(v)
 
-def infer_level(exp):
-    """Fallback difficulty inference from years of experience, used only
-    when the user has not picked an explicit preferred_difficulty."""
+def to_float(v, default=None):
     try:
-        exp = float(exp)
-    except Exception:
-        exp = 0.0
-    if exp == 0:  return "Beginner"
-    if exp <= 2:  return "Intermediate"
-    return "Advanced"
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 def jaccard_sim(a, b):
     s1, s2 = set(a.lower().split()), set(b.lower().split())
     u = s1 | s2
     return len(s1 & s2) / len(u) if u else 0.0
 
-def get_numeric_col(df, col):
+def get_col(df, col):
     if col in df.columns:
         return pd.to_numeric(df[col], errors="coerce").fillna(0).values.astype(float)
     return np.zeros(len(df))
 
-def build_course_text(row):
-    """Corpus text per course for embeddings — title weighted x2, plus the
-    real description and skills text (the whole reason Coursera was chosen
-    over Udemy: there's actual content here, not just a title)."""
-    name  = safe(row.get("course_name"))
-    desc  = safe(row.get("course_description"))
-    skl   = safe(row.get("skills"))
-    return f"{name} {name} {desc} {skl}"
+def normalize_domain_text(s):
+    return str(s).replace("-", " ").replace("_", " ").lower()
 
-def build_url(row):
-    """Coursera URLs in this dataset are real, full course links — use
-    directly rather than constructing a search URL."""
-    url = str(row.get("course_url", "")).strip()
-    if url.startswith("http"):
-        return url
-    name = str(row.get("course_name", "")).strip()
-    if name:
-        import urllib.parse
-        query = urllib.parse.quote_plus(name)
-        return f"https://www.coursera.org/search?query={query}"
-    return "https://www.coursera.org"
-
-# ── Domain vocabulary mapping ─────────────────────────────────────────────────
-# Maps the fixed dropdown labels used in Profile.js to the REAL primary_domain
-# / secondary_domain tag vocabulary found in courses.csv (117 unique tags,
-# extracted from the dataset's own Skills field — see enrichment pipeline).
-# This is a documented bridging table, not a guess: every tag on the right
-# was confirmed present in the dataset before being used here.
-
-INTEREST_DOMAIN_MAP = {
-    "Data Science":                    ["data-science", "data-analysis"],
-    "Machine Learning":                ["machine-learning"],
-    "Artificial Intelligence":         ["machine-learning", "computer-science"],
-    "Software Development":            ["software-development", "computer-science"],
-    "Web & Mobile Development":        ["mobile-and-web-development"],
-    "Cyber Security":                  ["computer-security-and-networks"],
-    "Cloud Computing":                 ["cloud-computing"],
-    "IT & Networking":                 ["information-technology"],
-    "Business Strategy":               ["business-strategy", "business-essentials"],
-    "Leadership & Management":         ["leadership-and-management"],
-    "Data Analysis & Statistics":      ["data-analysis", "probability-and-statistics"],
-    "Public Health":                   ["public-health", "patient-care"],
-    "Life Sciences":                   ["life-sciences"],
-    "Physical Sciences & Engineering": ["physical-science-and-engineering",
-                                        "mechanical-engineering", "electrical-engineering"],
-    "Arts & Humanities":               ["arts-and-humanities", "music-and-art"],
-    "Language Learning":               ["language-learning", "learning-english"],
-    "Personal Development":            ["personal-development"],
-    "Environmental Science":           ["environmental-science-and-sustainability"],
-    "Design & Product":                ["design-and-product"],
-    "Social Sciences":                 ["social-sciences", "governance-and-society"],
+# ── Keyword expansion ─────────────────────────────────────────────────────────
+# Keyed to the "interests" dropdown values used in the Profile form.
+EXPAND = {
+    "data science":                     "pandas numpy statistics visualization sql data analysis",
+    "computer science":                 "algorithms data structures programming software",
+    "business":                         "strategy management finance marketing entrepreneurship",
+    "arts & humanities":                "history philosophy literature writing culture",
+    "health":                           "medicine nutrition anatomy public health wellness",
+    "personal development":             "productivity leadership communication mindfulness",
+    "language learning":                "vocabulary grammar speaking fluency conversation",
+    "physical science & engineering":   "physics mechanics electronics engineering design",
+    "social sciences":                  "psychology sociology economics research behavior",
+    "music & art":                      "design creativity drawing composition visual art",
+}
+# Free-text career_goal / target_job_role substring expansion.
+GOAL_EXPAND = {
+    "data scientist":            "python sql statistics machine learning data",
+    "machine learning engineer": "tensorflow pytorch deployment mlops",
+    "software engineer":         "algorithms data structures system design",
+    "web developer":             "javascript react html css node api",
+    "mobile app developer":      "swift kotlin flutter react native",
+    "cyber security specialist": "penetration testing hacking network",
+    "cloud engineer":            "aws azure terraform kubernetes",
+    "ai researcher":             "deep learning nlp computer vision",
+    "devops engineer":           "docker kubernetes jenkins pipeline",
+    "business analyst":          "excel sql reporting stakeholder analysis",
+    "product manager":           "roadmap stakeholder agile user research",
 }
 
-JOBROLE_DOMAIN_MAP = {
-    "Data Scientist":              ["data-science", "machine-learning"],
-    "Machine Learning Engineer":   ["machine-learning", "software-development"],
-    "Software Engineer":           ["software-development", "computer-science"],
-    "Web/Mobile Developer":        ["mobile-and-web-development"],
-    "Cyber Security Specialist":   ["computer-security-and-networks"],
-    "Cloud Engineer":              ["cloud-computing", "information-technology"],
-    "Business Analyst":            ["business-essentials", "data-analysis"],
-    "Product Manager":             ["design-and-product", "business-strategy"],
-    "Healthcare Professional":     ["public-health", "life-sciences", "patient-care"],
-    "Researcher / Academic":       ["research-methods", "physical-science-and-engineering"],
-    "Manager / Team Lead":         ["leadership-and-management"],
-    "Career Switcher / Exploring": [],
-}
+def expand_keywords(interests, goal, difficulty):
+    out = []
+    il = interests.lower()
+    for k, v in EXPAND.items():
+        if k in il:
+            out.append(v)
+    gl = goal.lower()
+    for k, v in GOAL_EXPAND.items():
+        if k in gl:
+            out.append(v)
+    out.append(difficulty.lower())
+    return " ".join(out)
 
-INDUSTRY_DOMAIN_MAP = {
-    "Technology":                    ["information-technology", "software-development", "computer-science"],
-    "Finance":                       ["business-essentials", "business-strategy"],
-    "Healthcare":                    ["public-health", "life-sciences", "patient-care"],
-    "Education":                     ["personal-development", "language-learning"],
-    "Government / Public Sector":    ["governance-and-society"],
-    "Media, Arts & Entertainment":   ["arts-and-humanities", "music-and-art"],
-    "Manufacturing & Engineering":   ["mechanical-engineering", "electrical-engineering",
-                                       "physical-science-and-engineering"],
-    "Environmental / Sustainability":["environmental-science-and-sustainability"],
-    "Other / Not sure":              [],
-}
+# ── Improvement 4: Profile-to-field mapping ───────────────────────────────────
+def budget_score(user_budget, is_free_to_audit, budget_tier):
+    ub = (user_budget or "").lower()
+    free_audit = bool(is_free_to_audit)
+    if "free only" in ub:
+        return 1.0 if free_audit else 0.15
+    if "free to audit" in ub:
+        return 1.0 if free_audit else 0.5
+    return 1.0  # "Paid - any budget" → no constraint
 
-def user_domain_tags(user):
-    tags = set()
-    tags.update(INTEREST_DOMAIN_MAP.get(safe(user.get("interests")), []))
-    tags.update(JOBROLE_DOMAIN_MAP.get(safe(user.get("target_job_role")), []))
-    tags.update(INDUSTRY_DOMAIN_MAP.get(safe(user.get("target_industry")), []))
-    return tags
-
-# ── Profile-to-field mapping (context-aware scoring) ──────────────────────────
-COMPLETION_WEEKS_MAP = {
-    "Within a week":        1.0,
-    "Within a month":       4.0,
-    "1-3 months":          10.0,
-    "No specific deadline":26.0,
-}
-
-def budget_score(user_budget, is_free_to_audit):
-    """budget_tier on the course side collapses to a binary is_free_to_audit
-    flag; only 'Free courses only' users are actually constrained by it."""
-    if user_budget == "Free courses only":
-        return 1.0 if is_free_to_audit else 0.15
-    return 1.0
-
-def time_score(hours_per_week, completion_time, duration_hours):
-    weeks = COMPLETION_WEEKS_MAP.get(completion_time, 8.0)
-    total_available = max(float(hours_per_week or 0), 0.0) * weeks
-    if total_available <= 0 or duration_hours <= 0:
+def time_score(available_hours_per_week, estimated_duration_hours):
+    weekly = to_float(available_hours_per_week, 5.0) or 5.0
+    if weekly <= 0:
+        weekly = 5.0
+    ideal = weekly * 4.0  # rough 1-month horizon
+    dur = to_float(estimated_duration_hours, 0.0) or 0.0
+    if dur <= 0:
         return 0.5
-    diff = abs(duration_hours - total_available)
-    return max(0.0, 1.0 - diff / (total_available + 1e-9))
+    diff = abs(dur - ideal)
+    return max(0.0, 1.0 - diff / (ideal + 1e-9))
 
-def mode_score(user_mode, course_mode):
-    if user_mode in (None, "", "No preference"):
-        return 1.0
-    key = "Hands-on" if "Hands-on" in user_mode else "Video"
-    return 1.0 if key.lower() in str(course_mode).lower() else 0.3
-
-def cert_score(cert_needed, cert_offered):
-    """certification_offered is constant True across this dataset, so this
-    will rarely discriminate between courses — kept for schema completeness,
-    weighted minimally in the final score."""
-    if cert_needed:
-        return 1.0 if cert_offered else 0.3
+def cert_score(certification_needed, certification_offered):
+    needed = str(certification_needed).lower() in ("yes", "true", "1")
+    if needed:
+        return 1.0 if bool(certification_offered) else 0.3
     return 1.0
 
-def difficulty_score(user_level_label, course_level_label):
-    lmap = {"Beginner": 1, "Intermediate": 2, "Conversant": 2,
-            "Advanced": 3, "Not Calibrated": 2}
-    u = lmap.get(user_level_label, 2)
-    c = lmap.get(str(course_level_label).strip(), 2)
-    return 1.0 / (1.0 + abs(u - c))
+def mode_score(user_mode, course_learning_mode, course_format):
+    um = (user_mode or "").lower().strip()
+    if not um or "no preference" in um:
+        return 0.7
+    text = f"{course_learning_mode} {course_format}".lower()
+    if "self-paced" in um and "self-paced" in text:
+        return 1.0
+    if "instructor" in um and ("instructor" in text or "scheduled" in text or "cohort" in text):
+        return 1.0
+    if "hands-on" in um and ("hands-on" in text or "lab" in text or "guided project" in text):
+        return 1.0
+    if "video" in um and "video" in text:
+        return 1.0
+    words = [w for w in um.replace("/", " ").split() if len(w) > 3]
+    return 0.6 if any(w in text for w in words) else 0.3
 
-# ── Feedback helpers (collaborative filtering + XGBoost training signal) ─────
+# ── Improvement 1+2: Feedback helpers ────────────────────────────────────────
 def get_feedback_boost(username, course_ids):
     if not course_ids:
         return {}
@@ -238,13 +221,16 @@ def get_feedback_boost(username, course_ids):
         cur  = conn.cursor(dictionary=True)
         ph   = ",".join(["%s"] * len(course_ids))
 
+        # Direct user feedback
         cur.execute(
             f"SELECT course_id, liked FROM feedback WHERE username=%s AND course_id IN ({ph})",
             [username] + list(course_ids)
         )
         rows  = cur.fetchall()
+        # Small nudge only — feedback should not override profile matching
         boost = {r["course_id"]: (0.08 if r["liked"] else -0.06) for r in rows}
 
+        # Collaborative filtering: find courses liked by similar users
         liked_ids = [r["course_id"] for r in rows if r["liked"]]
         if liked_ids:
             ph2 = ",".join(["%s"] * len(liked_ids))
@@ -333,91 +319,120 @@ def recommend_courses(user):
     n = len(df)
     print(f"[REC] {n} courses")
 
-    # Numeric course-side signals
-    rating   = get_numeric_col(df, "course_rating")
-    duration = get_numeric_col(df, "estimated_duration_hours")
-    is_free  = df["is_free_to_audit"].astype(str).str.lower().isin(["1", "true"]).values
-    cert_off = df["certification_offered"].astype(str).str.lower().isin(["1", "true"]).values
+    # Numeric course fields (new schema)
+    rating   = get_col(df, "course_rating")
+    duration = get_col(df, "estimated_duration_hours")
+    rating_norm = np.clip(rating / 5.0, 0, 1)
+    dur_norm    = duration / (duration.max() + 1e-9)
 
-    rating_norm   = np.clip(rating / 5.0, 0, 1)
-    duration_norm = duration / (duration.max() + 1e-9)
+    is_free_to_audit       = df["is_free_to_audit"].tolist()
+    certification_offered  = df["certification_offered"].tolist()
+    budget_tier            = df["budget_tier"].astype(str).tolist()
+    time_commitment_tier   = df["time_commitment_tier"].astype(str).tolist()
+    learning_mode_course   = df["learning_mode"].astype(str).tolist()
+    course_format          = df["course_format"].astype(str).tolist()
+    primary_domain         = df["primary_domain"].astype(str).tolist()
+    secondary_domain       = df["secondary_domain"].astype(str).tolist()
+    difficulty_level       = df["difficulty_level"].astype(str).tolist()
 
-    # User fields
-    preferred_difficulty = safe(user.get("preferred_difficulty"))
-    if preferred_difficulty in ("", "Any"):
-        preferred_difficulty = infer_level(user.get("experience_years", 0))
+    # User fields (new schema)
+    interests           = safe(user.get("interests"))
+    career_goal         = safe(user.get("career_goal"))
+    existing_skills      = safe(user.get("existing_skills"))
+    desired_skills       = safe(user.get("desired_skills"))
+    target_job_role      = safe(user.get("target_job_role"))
+    target_industry      = safe(user.get("target_industry"))
+    preferred_difficulty = safe(user.get("preferred_difficulty")) or "Intermediate"
+    learning_objective   = safe(user.get("learning_objective"))
+    content_preference   = safe(user.get("content_preference"))
+    teaching_style       = safe(user.get("teaching_style"))
+    user_budget          = safe(user.get("budget"))
+    available_hours      = user.get("available_hours_per_week")
+    user_learning_mode   = safe(user.get("learning_mode"))
+    certification_needed = safe(user.get("certification_needed"))
 
-    interests      = safe(user.get("interests"))
-    desired_skills = safe(user.get("desired_skills"))
-    existing_skills= safe(user.get("existing_skills"))
-    job_role       = safe(user.get("target_job_role"))
-    industry       = safe(user.get("target_industry"))
-    objective      = safe(user.get("learning_objective"))
-    budget         = safe(user.get("budget"))
-    hours_per_week = user.get("available_hours_per_week") or 0
-    completion_time= safe(user.get("completion_time"))
-    learning_mode  = safe(user.get("learning_mode"))
-    cert_needed    = str(user.get("certification_needed")).lower() in ("1", "true", "yes")
+    # Text corpus (courses) — shared builder so the embedding cache can hit
+    corpus = build_corpus(df)
 
-    # Text corpus for embeddings
-    course_corpus = [build_course_text(r) for r in rows]
-    user_text = " ".join([
-        (interests + " ") * 3,
-        (desired_skills + " ") * 2,
-        (job_role + " ") * 2,
-        industry, objective, existing_skills, preferred_difficulty,
+    core = (interests + " " + career_goal + " " + desired_skills + " " +
+            existing_skills + " " + target_job_role + " " + target_industry + " ") * 3
+    ctx  = " ".join([
+        learning_objective, content_preference, teaching_style,
+        preferred_difficulty,
+        expand_keywords(interests, career_goal + " " + target_job_role, preferred_difficulty)
     ])
+    user_text = core + ctx
 
     # Similarity
     if USE_SEMANTIC:
         print("[REC] Semantic similarity (cached)...")
-        course_emb = get_course_embeddings(course_corpus)
+        course_emb = get_course_embeddings(corpus)
         user_emb   = _ST.encode([user_text], show_progress_bar=False,
                                 normalize_embeddings=True)
-        cos = cosine_similarity(user_emb, course_emb).flatten()
+        cos        = cosine_similarity(user_emb, course_emb).flatten()
     else:
         print("[REC] TF-IDF similarity...")
         tfidf  = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), sublinear_tf=True)
-        matrix = tfidf.fit_transform(course_corpus)
+        matrix = tfidf.fit_transform(corpus)
         cos    = cosine_similarity(tfidf.transform([user_text]), matrix).flatten()
 
-    jac = np.array([jaccard_sim(user_text, c) for c in course_corpus])
+    jac = np.array([jaccard_sim(user_text, c) for c in corpus])
 
-    # Domain boost — matched against real primary/secondary_domain tags
-    tags = user_domain_tags(user)
-    primary_domains   = df["primary_domain"].astype(str).tolist()
-    secondary_domains = df["secondary_domain"].astype(str).tolist()
+    # Domain boost — word-overlap between interests/target_industry and the
+    # course's primary/secondary domain (domain slugs are hyphenated, so
+    # normalize before comparing).
+    interest_words = set(
+        w for w in (interests + " " + target_industry).lower().replace("&", " ").split()
+        if len(w) > 2
+    )
+    dom_text = [
+        normalize_domain_text(pd_) + " " + normalize_domain_text(sd)
+        for pd_, sd in zip(primary_domain, secondary_domain)
+    ]
     dom_boost = np.array([
-        1.0 if pd_ in tags else 0.6 if sd_ in tags else 0.0
-        for pd_, sd_ in zip(primary_domains, secondary_domains)
+        1.0 if interest_words and all(w in dt for w in interest_words)
+        else 0.5 if any(w in dt for w in interest_words)
+        else 0.0
+        for dt in dom_text
     ])
 
-    # Difficulty
-    diff = np.array([
-        difficulty_score(preferred_difficulty, lvl)
-        for lvl in df["difficulty_level"].astype(str).tolist()
+    # Difficulty match
+    lmap  = {"beginner": 1, "intermediate": 2, "advanced": 3, "mixed": 2}
+    u_lvl = lmap.get(preferred_difficulty.lower(), 2)
+    diff  = np.array([
+        1.0 / (1.0 + abs(u_lvl - lmap.get(str(s).split()[0].lower(), 2)))
+        if str(s).strip() else 0.5
+        for s in difficulty_level
     ])
 
-    # Context-aware field scores
-    budget_sc = np.array([budget_score(budget, f) for f in is_free])
-    time_sc   = np.array([time_score(hours_per_week, completion_time, d) for d in duration])
-    mode_sc   = np.array([mode_score(learning_mode, m) for m in df["learning_mode"].tolist()])
-    cert_sc   = np.array([cert_score(cert_needed, c) for c in cert_off])
+    # Improvement 4: direct field mapping (Coursera fields)
+    budget_sc = np.array([
+        budget_score(user_budget, fa, bt)
+        for fa, bt in zip(is_free_to_audit, budget_tier)
+    ])
+    time_sc = np.array([time_score(available_hours, d) for d in duration])
+    cert_sc = np.array([
+        cert_score(certification_needed, co) for co in certification_offered
+    ])
+    mode_sc = np.array([
+        mode_score(user_learning_mode, lm, cf)
+        for lm, cf in zip(learning_mode_course, course_format)
+    ])
 
-    # Feature matrix for XGBoost (10 features)
+    # Feature matrix (10 features)
     X_raw = np.column_stack([
-        cos, jac, dom_boost, diff,
-        budget_sc, time_sc, mode_sc, cert_sc,
-        rating_norm, duration_norm
+        cos, jac, rating_norm, diff, dom_boost,
+        dur_norm, budget_sc, time_sc, cert_sc, mode_sc
     ])
     scaler = MinMaxScaler()
-    X = scaler.fit_transform(X_raw)
+    X      = scaler.fit_transform(X_raw)
 
     # Proxy target
-    y_proxy = (cos * 0.30 + dom_boost * 0.25 + diff * 0.15 + budget_sc * 0.10 +
-               time_sc * 0.08 + mode_sc * 0.05 + rating_norm * 0.05 + cert_sc * 0.02)
+    y_proxy = (cos * 0.30 + jac * 0.05 + dom_boost * 0.25 + diff * 0.15 +
+               rating_norm * 0.08 + budget_sc * 0.08 + time_sc * 0.05 +
+               cert_sc * 0.02 + mode_sc * 0.02)
 
-    # Feedback blending — only once enough real signals exist
+    # Improvement 1: only blend feedback when we have ENOUGH signals (min 15)
     fb_rows = get_feedback_for_training(username)
     MIN_FEEDBACK_FOR_TRAINING = 15
     if fb_rows and len(fb_rows) >= MIN_FEEDBACK_FOR_TRAINING:
@@ -436,26 +451,29 @@ def recommend_courses(user):
     model = get_model(X, y_final)
     ml_sc = np.clip(model.predict(X), 0, 1)
 
-    # Final weighted score (sums to 1.0)
-    final = (cos       * 0.32 +
+    # Profile-driven scoring — cos and dom_boost dominate
+    final = (cos       * 0.35 +
              dom_boost * 0.25 +
              diff      * 0.15 +
              ml_sc     * 0.10 +
-             budget_sc * 0.06 +
-             time_sc   * 0.05 +
-             mode_sc   * 0.03 +
+             budget_sc * 0.05 +
+             jac       * 0.03 +
+             time_sc   * 0.03 +
              rating_norm * 0.02 +
              cert_sc   * 0.01 +
-             jac       * 0.01)
+             mode_sc   * 0.01)
     df["final_score"] = final
+    df["ml_score"]    = np.round(ml_sc * 100, 1)
+    df["cos_score"]   = np.round(cos * 100, 1)
 
     top5_idx = np.argsort(final)[::-1][:5]
-    print("[ML SCORES] Top 5 predictions:")
+    print("[ML SCORES] Top 5 XGBoost predictions:")
     for i, idx in enumerate(top5_idx):
-        print(f"  #{i+1} ml={ml_sc[idx]:.4f}  cos={cos[idx]:.4f}  "
-              f"final={final[idx]:.4f}  name={df.iloc[idx]['course_name'][:50]}")
+        print(f"  #{i+1} ml={ml_sc[idx]:.4f} ({ml_sc[idx]*100:.1f}%)  "
+              f"cos={cos[idx]:.4f}  final={final[idx]:.4f}  "
+              f"title={str(df.iloc[idx]['course_name'])[:50]}")
 
-    # Post-scoring feedback / collaborative-filtering boost
+    # Improvement 1+2: post-scoring feedback/collaborative boost
     fb_boost = get_feedback_boost(username, df["course_id"].tolist())
     if fb_boost:
         print(f"[REC] Feedback boost on {len(fb_boost)} courses")
@@ -478,31 +496,20 @@ def recommend_courses(user):
     n_results = max(6, min(15, cutoff))
     top_n = df.head(n_results).copy()
 
-    KEEP_COLS = ["course_id", "course_name", "university", "difficulty_level",
-                 "course_rating", "primary_domain", "secondary_domain",
-                 "budget_tier", "is_free_to_audit", "estimated_duration_hours",
-                 "time_commitment_tier", "learning_mode", "final_score", "rank"]
+    KEEP_COLS = [
+        "course_id", "course_name", "university", "difficulty_level", "course_rating",
+        "skills", "course_format", "budget_tier", "is_free_to_audit",
+        "certification_offered", "estimated_duration_hours", "time_commitment_tier",
+        "learning_mode", "primary_domain", "secondary_domain", "course_url",
+        "final_score", "rank"
+    ]
     display_cols = [c for c in KEEP_COLS if c in top_n.columns]
     result = top_n[display_cols].copy()
-    result["course_url"] = top_n.apply(build_url, axis=1)
 
     top_score = float(result["final_score"].iloc[0]) if len(result) > 0 else 0
     print(f"[REC] Done: n={n_results}, top_score={top_score:.4f}")
     return result.to_dict("records"), preferred_difficulty
 
-
-# ── Value conversion maps (frontend select labels -> DB storage types) ───────
-ACADEMIC_PERFORMANCE_MAP = {
-    "Below 60%": 55.0, "60% - 75%": 67.5, "75% - 90%": 82.5,
-    "90%+": 95.0, "Prefer not to say": None,
-}
-HOURS_PER_WEEK_MAP = {
-    "1-2 hrs/week": 2.0, "3-5 hrs/week": 5.0,
-    "5-10 hrs/week": 10.0, "10+ hrs/week": 20.0,
-}
-
-def to_bool_int(v):
-    return 1 if str(v).strip().lower() in ("1", "true", "yes") else 0
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -548,6 +555,18 @@ def login():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# Personalization + context fields, exactly matching Schema.sql `users` table.
+PROFILE_FIELDS = [
+    "interests", "career_goal",
+    "education_level", "degree_field", "current_year", "academic_performance",
+    "existing_skills", "experience_level", "experience_years",
+    "desired_skills", "target_job_role", "target_industry",
+    "preferred_difficulty", "preferred_language",
+    "learning_objective", "content_preference", "teaching_style",
+    "budget", "available_hours_per_week", "completion_time",
+    "learning_mode", "certification_needed",
+]
+
 @app.route("/api/profile", methods=["POST"])
 def profile():
     try:
@@ -561,35 +580,38 @@ def profile():
             cur.close(); conn.close()
             return jsonify({"status": "fail", "message": "User not found."}), 404
 
-        academic_performance = ACADEMIC_PERFORMANCE_MAP.get(
-            d.get("academic_performance"), None)
-        hours_per_week = HOURS_PER_WEEK_MAP.get(
-            d.get("available_hours_per_week"), 5.0)
-        cert_needed = to_bool_int(d.get("certification_needed"))
+        cert_val = 1 if str(d.get("certification_needed", "")).strip().lower() == "yes" else 0
+
+        values = {
+            "interests":                d.get("interests"),
+            "career_goal":              d.get("career_goal"),
+            "education_level":          d.get("education_level"),
+            "degree_field":             d.get("degree_field"),
+            "current_year":             d.get("current_year"),
+            "academic_performance":     to_float(d.get("academic_performance")),
+            "existing_skills":          d.get("existing_skills"),
+            "experience_level":         d.get("experience_level"),
+            "experience_years":         to_float(d.get("experience_years")),
+            "desired_skills":           d.get("desired_skills"),
+            "target_job_role":          d.get("target_job_role"),
+            "target_industry":          d.get("target_industry"),
+            "preferred_difficulty":     d.get("preferred_difficulty"),
+            "preferred_language":       d.get("preferred_language"),
+            "learning_objective":       d.get("learning_objective"),
+            "content_preference":       d.get("content_preference"),
+            "teaching_style":           d.get("teaching_style"),
+            "budget":                   d.get("budget"),
+            "available_hours_per_week": to_float(d.get("available_hours_per_week")),
+            "completion_time":          d.get("completion_time"),
+            "learning_mode":            d.get("learning_mode"),
+            "certification_needed":     cert_val,
+        }
 
         cur = conn.cursor()
+        set_clause = ", ".join(f"{col}=%s" for col in values.keys())
         cur.execute(
-            """UPDATE users SET
-                 interests=%s, career_goal=%s,
-                 education_level=%s, degree_field=%s, current_year=%s,
-                 academic_performance=%s,
-                 existing_skills=%s, experience_level=%s, experience_years=%s,
-                 desired_skills=%s, target_job_role=%s, target_industry=%s,
-                 preferred_difficulty=%s, preferred_language=%s,
-                 learning_objective=%s, content_preference=%s, teaching_style=%s,
-                 budget=%s, available_hours_per_week=%s, completion_time=%s,
-                 learning_mode=%s, certification_needed=%s
-               WHERE username=%s""",
-            (d.get("interests"), d.get("career_goal"),
-             d.get("education_level"), d.get("degree_field"), d.get("current_year"),
-             academic_performance,
-             d.get("existing_skills"), d.get("experience_level"), d.get("experience_years"),
-             d.get("desired_skills"), d.get("target_job_role"), d.get("target_industry"),
-             d.get("preferred_difficulty"), d.get("preferred_language"),
-             d.get("learning_objective"), d.get("content_preference"), d.get("teaching_style"),
-             d.get("budget"), hours_per_week, d.get("completion_time"),
-             d.get("learning_mode"), cert_needed,
-             u)
+            f"UPDATE users SET {set_clause} WHERE username=%s",
+            list(values.values()) + [u]
         )
         conn.commit(); cur.close(); conn.close()
 
@@ -674,18 +696,14 @@ def profile_load():
         user = cur.fetchone(); cur.close(); conn.close()
         if not user:
             return jsonify({"status": "fail"}), 404
-        profile_fields = [
-            "interests", "career_goal",
-            "education_level", "degree_field", "current_year", "academic_performance",
-            "existing_skills", "experience_level", "experience_years",
-            "desired_skills", "target_job_role", "target_industry",
-            "preferred_difficulty", "preferred_language",
-            "learning_objective", "content_preference", "teaching_style",
-            "budget", "available_hours_per_week", "completion_time",
-            "learning_mode", "certification_needed",
-        ]
-        profile = {f: user.get(f) for f in profile_fields}
-        return jsonify({"status": "success", "profile": profile})
+
+        profile_out = {}
+        for f in PROFILE_FIELDS:
+            v = user.get(f)
+            if f == "certification_needed":
+                v = "Yes" if v else "No"
+            profile_out[f] = v
+        return jsonify({"status": "success", "profile": profile_out})
     except Exception as e:
         print(f"[PROFILE LOAD] {traceback.format_exc()}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -696,16 +714,48 @@ def logout():
     return jsonify({"status": "logged_out"})
 
 
-@app.route("/api", methods=["GET", "POST", "OPTIONS"])
-@app.route("/api/", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/setup", methods=["POST"])
+def setup():
+    """
+    One-time DB migration — run once after deploying.
+    users/courses are already fully defined by Schema.sql; this route only
+    ensures the feedback table exists (it references courses.course_id).
+    """
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+            id         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            username   VARCHAR(80)  NOT NULL,
+            course_id  INT UNSIGNED NOT NULL,
+            liked      TINYINT(1)   NOT NULL DEFAULT 1,
+            created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_user_course (username, course_id),
+            INDEX idx_username (username),
+            INDEX idx_course   (course_id),
+            CONSTRAINT fk_feedback_course FOREIGN KEY (course_id)
+                REFERENCES courses(course_id) ON DELETE CASCADE
+        ) ENGINE=InnoDB
+    """)
+    conn.commit(); cur.close(); conn.close()
+    return jsonify({"status": "done"})
+
+
+@app.route("/api", methods=["GET","POST","OPTIONS"])
+@app.route("/api/", methods=["GET","POST","OPTIONS"])
 def api_root():
+    """Catch-all for bare /api requests — returns available routes."""
     return jsonify({
         "status": "ok",
         "message": "Course Recommender API",
         "routes": [
-            "POST /api/register", "POST /api/login", "POST /api/logout",
-            "POST /api/profile", "POST /api/profile/load",
-            "POST /api/recommend", "POST /api/feedback",
+            "POST /api/register",
+            "POST /api/login",
+            "POST /api/logout",
+            "POST /api/profile",
+            "POST /api/profile/load",
+            "POST /api/recommend",
+            "POST /api/feedback",
+            "POST /api/setup",
         ]
     })
 
