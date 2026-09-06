@@ -491,6 +491,10 @@ h1 { font-family: 'Inter', sans-serif; font-size: 1.75rem; font-weight: 800; col
 .tag--intermediate { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
 .tag--advanced     { background: #fce7f3; color: #9d174d; border: 1px solid #fbcfe8; }
 .tag--alllevels    { background: #f3e8ff; color: #6b21a8; border: 1px solid #e9d5ff; }
+.tag--skill        { background: var(--bg-2, #f3f4f6); color: var(--text-2, #4b5563); border: 1px solid var(--border, #e5e7eb); font-weight: 600; }
+
+.course-row-university { font-size: .78rem; color: var(--text-2, #6b7280); font-weight: 500; margin-top: 2px; }
+.course-row-skills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
 
 .loading-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 80px 20px; color: var(--text-2); font-size: .95rem; }
 .loading-icon { width: 44px; height: 44px; border: 3px solid var(--border); border-top-color: var(--indigo); border-radius: 50%; animation: spin .9s linear infinite; }
