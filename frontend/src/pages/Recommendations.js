@@ -6,24 +6,37 @@ import "../App.css";
 // ── Pure helpers (no hooks) ───────────────────────────────────────────────────
 function levelClass(d) {
   if (!d) return "beginner";
-  const k = d.toLowerCase();
-  if (k === "intermediate" || k === "conversant") return "intermediate";
+  const k = d.toLowerCase().split(" ")[0];
+  if (k === "intermediate") return "intermediate";
   if (k === "advanced")     return "advanced";
+  if (k === "all")          return "alllevels";
   return "beginner";
 }
 
 function levelPillClass(l) {
   if (!l) return "level-pill--beginner";
   const k = l.toLowerCase();
-  if (k === "intermediate" || k === "conversant") return "level-pill--intermediate";
+  if (k === "intermediate") return "level-pill--intermediate";
   if (k === "advanced")     return "level-pill--advanced";
   return "level-pill--beginner";
 }
 
-function fmtHours(h) {
-  const num = Number(h);
-  if (!num || isNaN(num)) return null;
-  return num % 1 === 0 ? `${num}h` : `${num.toFixed(1)}h`;
+function levelLabel(d) {
+  if (!d) return "Beginner";
+  const k = d.toLowerCase().split(" ")[0];
+  if (k === "intermediate") return "Intermediate";
+  if (k === "advanced")     return "Advanced";
+  if (k === "all")          return "All Levels";
+  return "Beginner";
+}
+
+function firstSkills(skills, max = 4) {
+  if (!skills) return [];
+  // Coursera skills strings are whitespace/space-delimited tag lists —
+  // split on 2+ spaces first, fall back to commas, then single spaces.
+  let parts = String(skills).split(/\s{2,}/).filter(Boolean);
+  if (parts.length <= 1) parts = String(skills).split(",").filter(Boolean);
+  return parts.slice(0, max).map(s => s.trim()).filter(Boolean);
 }
 
 const RANK_GRADIENTS = [
@@ -101,12 +114,13 @@ function CourseRow({ course, rank, onFeedback }) {
       });
   };
 
-  const lvl      = levelClass(course.difficulty_level);
-  const grad     = RANK_GRADIENTS[(rank - 1) % RANK_GRADIENTS.length];
-  const url      = course.course_url || "https://www.coursera.org";
-  const duration = fmtHours(course.estimated_duration_hours);
-  const isFree   = String(course.is_free_to_audit).toLowerCase() === "true" ||
-                    course.is_free_to_audit === 1 || course.is_free_to_audit === true;
+  const lvl    = levelClass(course.difficulty_level);
+  const grad   = RANK_GRADIENTS[(rank - 1) % RANK_GRADIENTS.length];
+  const url    = course.course_url || "https://www.coursera.org";
+  const skills = firstSkills(course.skills);
+  const isFree = !!course.is_free_to_audit;
+  const hasCert = !!course.certification_offered;
+  const duration = course.estimated_duration_hours;
 
   return (
     <div className="course-row">
@@ -114,20 +128,41 @@ function CourseRow({ course, rank, onFeedback }) {
 
       <div className="course-row-body">
         <div className="course-row-top">
-          <h3 className="course-row-title">{course.course_name}</h3>
+          <div>
+            <h3 className="course-row-title">{course.course_name}</h3>
+            {course.university && (
+              <div className="course-row-university">{course.university}</div>
+            )}
+          </div>
           <ScoreRing score={course.final_score || 0} />
         </div>
         <div className="course-row-meta">
           <span className="tag tag--domain">{course.primary_domain || "General"}</span>
-          <span className={`tag tag--${lvl}`}>{course.difficulty_level || "Beginner"}</span>
-          {course.university && <span className="course-row-stat">🏫 {course.university}</span>}
-          {course.course_rating ? <span className="course-row-stat">⭐ {course.course_rating}</span> : null}
-          {duration && <span className="course-row-stat">⏱ {duration}</span>}
+          <span className={`tag tag--${lvl}`}>{levelLabel(course.difficulty_level)}</span>
+          {course.course_rating ? (
+            <span className="course-row-stat">⭐ {course.course_rating}</span>
+          ) : null}
+          {duration ? (
+            <span className="course-row-stat">
+              ⏱ {duration}h{course.time_commitment_tier ? ` · ${course.time_commitment_tier}` : ""}
+            </span>
+          ) : null}
           {isFree
             ? <span className="free-badge">Free to audit</span>
-            : <span className="course-row-stat">💳 Paid</span>
+            : <span className="course-row-stat">💳 {course.budget_tier || "Paid"}</span>
           }
+          {hasCert && <span className="course-row-stat">🏆 Certificate available</span>}
+          {course.learning_mode && (
+            <span className="course-row-stat">🖥 {course.learning_mode}</span>
+          )}
         </div>
+        {skills.length > 0 && (
+          <div className="course-row-skills">
+            {skills.map((s, i) => (
+              <span key={i} className="tag tag--skill">{s}</span>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="course-row-actions">
@@ -247,7 +282,7 @@ export default function Recommendations() {
 
         <div className="stats-strip">
           <div className="stat-cell">
-            <span className="stat-label">Your level</span>
+            <span className="stat-label">Preferred difficulty</span>
             <span className={`level-pill ${levelPillClass(level)}`}>{level}</span>
           </div>
           <div className="stat-cell">
