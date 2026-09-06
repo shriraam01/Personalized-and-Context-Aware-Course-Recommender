@@ -6,34 +6,24 @@ import "../App.css";
 // ── Pure helpers (no hooks) ───────────────────────────────────────────────────
 function levelClass(d) {
   if (!d) return "beginner";
-  const k = d.toLowerCase().split(" ")[0];
-  if (k === "intermediate") return "intermediate";
+  const k = d.toLowerCase();
+  if (k === "intermediate" || k === "conversant") return "intermediate";
   if (k === "advanced")     return "advanced";
-  if (k === "all")          return "alllevels";
   return "beginner";
 }
 
 function levelPillClass(l) {
-  if (l === "Intermediate") return "level-pill--intermediate";
-  if (l === "Advanced")     return "level-pill--advanced";
+  if (!l) return "level-pill--beginner";
+  const k = l.toLowerCase();
+  if (k === "intermediate" || k === "conversant") return "level-pill--intermediate";
+  if (k === "advanced")     return "level-pill--advanced";
   return "level-pill--beginner";
 }
 
-function levelLabel(d) {
-  if (!d) return "Beginner";
-  const k = d.toLowerCase().split(" ")[0];
-  if (k === "intermediate") return "Intermediate";
-  if (k === "advanced")     return "Advanced";
-  if (k === "all")          return "All Levels";
-  return "Beginner";
-}
-
-function fmt(n) {
-  const num = Number(n);
+function fmtHours(h) {
+  const num = Number(h);
   if (!num || isNaN(num)) return null;
-  if (num >= 1_000_000) return (num / 1_000_000).toFixed(1) + "M";
-  if (num >= 1_000)     return Math.round(num / 1_000) + "k";
-  return String(num);
+  return num % 1 === 0 ? `${num}h` : `${num.toFixed(1)}h`;
 }
 
 const RANK_GRADIENTS = [
@@ -88,16 +78,13 @@ function CourseRow({ course, rank, onFeedback }) {
     return () => { isMounted.current = false; };
   }, []);
 
-  // Use course.id if available, else course_id, else index
-  const courseId = course.id ?? course.course_id ?? null;
+  const courseId = course.course_id ?? null;
 
   const handleFeedback = (liked) => {
-    // Guard: don't fire if already sending or no valid course id
     if (sending || courseId === null || courseId === undefined) return;
 
-    // If clicking the same button again → toggle off (reset feedback)
     const isToggleOff = feedback === liked;
-    const valueToSend = isToggleOff ? !liked : liked; // send opposite to "reset"
+    const valueToSend = isToggleOff ? !liked : liked;
 
     setSending(true);
     onFeedback(courseId, valueToSend)
@@ -114,11 +101,12 @@ function CourseRow({ course, rank, onFeedback }) {
       });
   };
 
-  const lvl  = levelClass(course.difficulty);
-  const subs = fmt(course.num_subscribers);
-  const revs = fmt(course.num_reviews);
-  const grad = RANK_GRADIENTS[(rank - 1) % RANK_GRADIENTS.length];
-  const url  = course.course_url || "https://www.udemy.com";
+  const lvl      = levelClass(course.difficulty_level);
+  const grad     = RANK_GRADIENTS[(rank - 1) % RANK_GRADIENTS.length];
+  const url      = course.course_url || "https://www.coursera.org";
+  const duration = fmtHours(course.estimated_duration_hours);
+  const isFree   = String(course.is_free_to_audit).toLowerCase() === "true" ||
+                    course.is_free_to_audit === 1 || course.is_free_to_audit === true;
 
   return (
     <div className="course-row">
@@ -126,26 +114,23 @@ function CourseRow({ course, rank, onFeedback }) {
 
       <div className="course-row-body">
         <div className="course-row-top">
-          <h3 className="course-row-title">{course.title}</h3>
+          <h3 className="course-row-title">{course.course_name}</h3>
           <ScoreRing score={course.final_score || 0} />
         </div>
         <div className="course-row-meta">
-          <span className="tag tag--domain">{course.domain || "General"}</span>
-          <span className={`tag tag--${lvl}`}>{levelLabel(course.difficulty)}</span>
-          {subs && <span className="course-row-stat">👥 {subs} students</span>}
-          {revs && <span className="course-row-stat">⭐ {revs} reviews</span>}
-          {Number(course.price) === 0
-            ? <span className="free-badge">Free</span>
-            : course.price
-              ? <span className="course-row-stat">₹{course.price}</span>
-              : null
+          <span className="tag tag--domain">{course.primary_domain || "General"}</span>
+          <span className={`tag tag--${lvl}`}>{course.difficulty_level || "Beginner"}</span>
+          {course.university && <span className="course-row-stat">🏫 {course.university}</span>}
+          {course.course_rating ? <span className="course-row-stat">⭐ {course.course_rating}</span> : null}
+          {duration && <span className="course-row-stat">⏱ {duration}</span>}
+          {isFree
+            ? <span className="free-badge">Free to audit</span>
+            : <span className="course-row-stat">💳 Paid</span>
           }
         </div>
-
       </div>
 
       <div className="course-row-actions">
-        {/* Only show feedback buttons if we have a valid course ID */}
         {courseId !== null && courseId !== undefined && (
           <div className="feedback-btns">
             <button
@@ -169,7 +154,7 @@ function CourseRow({ course, rank, onFeedback }) {
           className="course-row-btn"
           onClick={() => window.open(url, "_blank", "noopener,noreferrer")}
         >
-          View on Udemy
+          View on Coursera
         </button>
       </div>
     </div>
@@ -211,10 +196,8 @@ export default function Recommendations() {
     return () => { cancelled = true; };
   }, [username, navigate]);
 
-  // Stable feedback handler — does NOT cause re-renders on its own
   const handleFeedback = useCallback((courseId, liked) => {
     return submitFeedback(courseId, liked).catch((e) => {
-      // Swallow silently — feedback failure is non-critical
       console.warn("Feedback API error:", e.message);
     });
   }, []);
@@ -245,7 +228,6 @@ export default function Recommendations() {
 
   const courses = data?.courses || [];
   const level   = data?.level   || "Beginner";
-  const rated   = courses.filter(c => c.final_score > 0).length;
 
   return (
     <div className="page-outer" style={{ alignItems: "flex-start", paddingTop: 36 }}>
@@ -290,7 +272,7 @@ export default function Recommendations() {
             <div className="courses-list">
               {courses.map((course, i) => (
                 <CourseRow
-                  key={course.id ?? course.course_id ?? i}
+                  key={course.course_id ?? i}
                   course={course}
                   rank={i + 1}
                   onFeedback={handleFeedback}
